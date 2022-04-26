@@ -1,0 +1,32 @@
+services:
+    glassdoorscraper:
+      build: 
+        context: ./GlassdoorScraper/
+      ports:
+        - "5000:5000"
+      environment:
+        DB-NAME: ${DBNAME}
+        DB-USER: ${DBUSER}
+        DB-PASSWORD: ${DBROOTPASSWORD}
+        API-MODE: ${APIMODE}
+      depends_on:
+        - redis
+      volumes:
+        - /dev/shm:/dev/shm
+
+    mysql:
+        image: mysql
+        restart: always
+        ports:
+            - 3306:3306
+        environment:
+            MYSQL_ROOT_PASSWORD: ${DBROOTPASSWORD}
+            MYSQL_USER: ${DBUSER}
+            MYSQL_PASSWORD: ${DBPASSWORD}
+            MYSQL_DATABASE: ${DBNAME}
+        volumes:
+            - ./ReviewDatabase/ReviewSchema.sql:/docker-entrypoint-initdb.d/setup.sql
+            - ./ReviewDatabase/db_data:/var/lib/mysql
+
+volumes:
+    db_data:

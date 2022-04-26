@@ -1,4 +1,5 @@
 flask
+flask_mysqldb
 redis
 requests
 selenium

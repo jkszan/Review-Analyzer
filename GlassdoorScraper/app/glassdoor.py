@@ -6,10 +6,12 @@ from selenium.common.exceptions import StaleElementReferenceException, NoSuchEle
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver import ActionChains
+from flask import g
+from app.common import CaptchaEncounteredException
+import logging
 import datetime
 import time
 import json
-
 
 # The locations of certain data elements on a glassdoor review change are subject to change as they develop their platform,
 # I have put all of the class information being used in getReviewInfo to pull data out of the HTML in one dict for ease of update.
@@ -17,6 +19,7 @@ import json
 locationDict = dict(
     review = "empReview",
     id = "id",
+    companyName = "tightAll",
     rating = "ratingNumber",
     headline = "reviewLink",
     employeeStatus = "pt-xsm pt-md-0 css-1qxtz39 eg4psks0",
@@ -24,7 +27,6 @@ locationDict = dict(
     titleAndDate = "authorJobTitle",
     nextButton = "nextButton"
 )
-
 
 class GlassdoorSession():
 
@@ -45,18 +47,44 @@ class GlassdoorSession():
 
         # Instantiating our drivers
         self.sessionDriver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
-        self.waitDriver = WebDriverWait(self.sessionDriver, 30)
+        self.waitDriver = WebDriverWait(self.sessionDriver, 10)
+
+        # Signing into account provided in the secrets.json file
+        self.authenticate(g.credentialFile)
 
     # Simple function to switch current page of sessionDriver
     def getPage(self, url):
+        g.appLogger.info('Getting url: ' + url)
         self.sessionDriver.get(url)
 
+        # Attempting to wait until page html has been loaded
+        try:
+            self.waitDriver.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'html')))
+        except Exception:
+            g.appLogger.info('Wait for new page to load has timed out')
+        
+        self.checkForCaptcha(2)
+
+    def getCompany(self):
+
+        maxRetries = 10
+
+        for attempt in range(maxRetries):
+            try:
+                self.waitDriver.until(EC.presence_of_element_located((By.CLASS_NAME, locationDict["companyName"])))
+                html_soup = BeautifulSoup(self.sessionDriver.page_source, 'html.parser')
+                return html_soup.find(class_=locationDict["companyName"])['data-company']
+            except Exception as e:
+                g.appLogger.debug('Failed to get company, retrying')
+        
+        self.checkForCaptcha(10)
+
     # Function to automate the sign in process
-    def authenticate(self):
+    def authenticate(self, credentialFile):
 
         # Trying to read information from the secrets.json file, located in the GlassdoorScraper folder
         try:
-            with open('secret.json') as f:
+            with open(credentialFile) as f:
                 d = json.loads(f.read())
                 userEmail = d['email']
                 userPassword = d['password']
@@ -79,34 +107,78 @@ class GlassdoorSession():
         signIn.move_to_element(passwordInput).send_keys(userPassword)
         signIn.click(on_element = submitButton)
         signIn.perform()
+    
+    def checkForCaptcha(self, maxRetries):
+        
+        captchaHeader = None
+        for attempt in range(maxRetries):
+            try:
+                captchaHeader = self.sessionDriver.find_element_by_css_selector('iframe[title=reCAPTCHA]')
+            except NoSuchElementException:
+                g.appLogger.debug('No element found for captcha check')
+            if captchaHeader:
+                raise CaptchaEncounteredException()
+
+            time.sleep(1)
+
+        
+
+
 
     # Getting an array of all reviews on a page
     def getPageReviews(self):
 
-        html_soup = BeautifulSoup(self.sessionDriver.page_source, 'html.parser')
-        reviews = html_soup.find_all(class_=locationDict['review'])
+        # Config for getPageReviews
+        maxRetries = 10
+
+        # Selenium is unreliable in it's data retrieval, occassionally loading so quickly as to go through
+        # getPageReviews without picking up any reviews. This loop attempts to grab reviews multiple times
+        # if there aren't any instantiated.
+
+        # Since Glassdoor loads all Reviews at the exact same time we are only concerned about getting zero
+        # reviews. If we get reviews at all we will get all of them. Expecting lower load (one or two loadReviews
+        # operations at a time) 10 seconds should be more than enough to get reviews > 99% of the time
+        for attempt in range(maxRetries):
+            html_soup = BeautifulSoup(self.sessionDriver.page_source, 'html.parser')
+            reviews = html_soup.find_all(class_=locationDict['review'])
+
+            if len(reviews) != 0:
+                return reviews
+            else:
+                g.appLogger.debug('No reviews found on this page, retrying')
+                time.sleep(1)
+
+        self.checkForCaptcha(10)
         return reviews
+
 
     # Function to automate navigation to the next page
     def paginate(self):
 
-        try:
-            nextButton = self.waitDriver.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.' + locationDict['nextButton'])))
-        except TimeoutException:
-            return False
+        nextButton = None
+        while not nextButton:
+            try:
+                nextButton = self.waitDriver.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.' + locationDict['nextButton'])))
 
-        if not nextButton.is_enabled():
-            return False
+                # Clicking button, this is usually more reliable than running nextButton.click()
+                ActionChains(self.sessionDriver).click(on_element = nextButton).perform()
 
-        ActionChains(self.sessionDriver).click(on_element = nextButton).perform()
+            except TimeoutException:
+                g.appLogger.info('Could not find button to navigate to the next page')
+                self.checkForCaptcha(10)
+                return False # On the last page of reviews the button will not be clickable, this is within expected behavior
+            except StaleElementReferenceException:
+                g.appLogger.debug('Retrieved button from previous page, trying again...')
+                time.sleep(1)
+                nextButton = None
 
         # While explicit waitDrivers and implicit wait statements on sessionDriver usually handle delays fairly well, there
         # it's never completely consistent. This eliminates the inconsistency of page loads and also paces requests as to not
         # be flagged as malicious by Glassdoor
-        time.sleep(3)
 
-        # Here, we wait until all reviews are loaded properly
-        self.waitDriver.until(EC.visibility_of_all_elements_located((By.CSS_SELECTOR, 'li.' + locationDict['review'])))
+        # This waits until the button on the old page is no longer attached to the DOM / when the new page is being loaded.
+        # We wait for this specifically to ensure that getPageReviews doesn't accidentally pick up the last page's reviews
+        self.waitDriver.until(EC.staleness_of(nextButton))
 
         return True
 
@@ -116,7 +188,7 @@ def getFromHTML(reviewInfo, review, valueName, location):
     try:
         reviewInfo[valueName] = review.find(class_=location).contents[0]
     except AttributeError:
-        print(valueName + ' could not be found, setting to None')
+        g.appLogger.info(valueName + ' could not be found, setting to None')
         reviewInfo[valueName] = None
 
 def getReviewInfo(review):
@@ -149,8 +221,8 @@ def getReviewInfo(review):
     # Splitting the titleAndDate variable into it's requisite parts
     # Only splitting once to accomidate people using a - in their job title
     titleAndDate = reviewInfo.pop('titleAndDate').split('-', 1)
-    reviewInfo["date posted"] = formatDate(titleAndDate[0].strip())
-    reviewInfo["job title"] = titleAndDate[1].strip()
+    reviewInfo["Date Posted"] = formatDate(titleAndDate[0].strip())
+    reviewInfo["Job Title"] = titleAndDate[1].strip()
 
     return reviewInfo
 
