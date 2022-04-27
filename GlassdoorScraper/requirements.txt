@@ -1,0 +1,8 @@
+flask
+flask_mysqldb
+redis
+requests
+selenium
+bs4
+webdriver_manager
+chromedriver-binary
